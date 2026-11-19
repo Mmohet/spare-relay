@@ -1535,6 +1535,8 @@ class StubZongguan extends EventEmitter {
   adviceFor(id) { return this.advice?.get(id) ?? null; }
   async hear(text, from) { this.heard.push([text, from]); return { st: 'sent', h: '总管收到' }; }
   async confirm(confirmId, yes) { this.confirmed.push([confirmId, yes]); return { st: 'ok', h: yes ? '好，去办了' : '不办了' }; }
+  menu() { this.state = { ...this.state, card: { kind: 'choices', choiceId: 'm1', options: ['现在都在干嘛', '跟进今天没结果的', '不用了'] } }; return { st: 'ok', h: '选一个' }; }
+  async choose(choiceId, n) { this.chosen = [...(this.chosen ?? []), [choiceId, n]]; return { st: 'sent', h: '总管收到' }; }
   markRead() { this.read += 1; this.unread = false; }
   publishReport(text) {
     this.reports = [...this.reports, { seq: (this.reports.at(-1)?.seq ?? 0) + 1, text, at: Date.now() }];
@@ -1631,6 +1633,24 @@ test('a confirm card pops up on the z page and a click answers it', async (t) =>
   assert.deepEqual(await glasses.act(page.k.slice(2) + '1'), { st: 'ok', h: '好，去办了' });
   assert.deepEqual(await glasses.act(page.k.slice(2) + 'n'), { st: 'ok', h: '不办了' });
   assert.deepEqual(zongguan.confirmed, [['c1', true], ['c1', false]]);
+});
+
+test('clicking on the z page and saying nothing brings up 总管\'s options; a click picks one', async (t) => {
+  const zongguan = new StubZongguan();
+  const { glasses } = await lensGateway(t, undefined, { zongguan });
+  assert.deepEqual(await glasses.say('-z', { text: '' }), { st: 'held', h: '' });
+  assert.deepEqual(await glasses.say('.z', { text: '' }), { st: 'ok', h: '选一个' }, 'two empty rounds call the options up');
+  assert.deepEqual(zongguan.heard, [], 'nothing was said to 总管');
+  const page = await glasses.page('z0');
+  assert.match(page.k, /^i5[0-9a-z]{4}$/);
+  assert.equal(glasses.now().k, page.k);
+  const view = glasses.askView(page.k.slice(2));
+  assert.equal(view.h, '总管 · 选一件');
+  assert.deepEqual([view.d4, view.d5, view.d6, view.d7, view.i], ['现在都在干嘛', '跟进今天没结果的', '不用了', '', '300'], 'no spoken answer');
+  assert.deepEqual(await glasses.act(page.k.slice(2) + '2'), { st: 'sent', h: '总管收到' });
+  assert.deepEqual(zongguan.chosen, [['m1', 2]]);
+  assert.deepEqual(await glasses.act(page.k.slice(2) + 'y'), { st: 'fail', h: '选一项' });
+  assert.deepEqual(await glasses.say('c', { text: '' }), { st: 'empty', h: '没听到内容' }, 'other pages are unchanged');
 });
 
 test('while 总管 is on, standby cards carry only its reports', async (t) => {

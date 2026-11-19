@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtemp, rm } from 'node:fs/promises';
+import { writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
@@ -186,7 +187,7 @@ const eventTurn = (id = 2, urgent = false) => ({ id, source: 'event', userAt: 0,
 
 test('toolSpecs name exactly the dispatch tools and nothing that does work', () => {
   assert.deepEqual(toolSpecs.map((tool) => tool.function.name), ['list_sessions', 'read_session', 'send_to_session', 'start_session',
-    'interrupt_session', 'answer_request', 'follow_up', 'recommend', 'track_session', 'drop_session', 'compact', 'clear_history', 'remember_instruction', 'report', 'show_card']);
+    'interrupt_session', 'answer_request', 'follow_up', 'recommend', 'track_session', 'drop_session', 'compact', 'clear_history', 'remember_instruction', 'report', 'show_card', 'offer_choices']);
 });
 
 test('read_session returns output text only unless include_tools is set', async (t) => {
@@ -356,6 +357,29 @@ test('list_sessions shows waiting requests and hides helper sessions', async (t)
   assert.match(out.content, /Claude · 眼镜胶囊 · glasses · 运行中/);
   assert.ok(out.content.includes('等你批准 request=' + id + '：要运行命令'));
   assert.doesNotMatch(out.content, /helper/);
+});
+
+test('list_sessions says how long ago each session moved and can keep only the recent ones', async (t) => {
+  const { tools, state } = await toolsFor(t);
+  state.put('codex', 's1', { updatedAt: Date.now() - 5 * 60000 });
+  state.put('claude', 's2', { updatedAt: Date.now() - 3 * 3600000 });
+  const all = await tools.run('list_sessions', {}, userTurn());
+  assert.match(all.content, /Codex · relay部署脚本 · relay · 空闲 · 5 分钟前/);
+  assert.match(all.content, /Claude · 眼镜胶囊 · glasses · 运行中 · 3 小时前/);
+  const recent = await tools.run('list_sessions', { since_minutes: 60 }, userTurn());
+  assert.match(recent.content, /relay部署脚本/);
+  assert.doesNotMatch(recent.content, /眼镜胶囊/);
+  assert.match((await tools.run('list_sessions', { since_minutes: 1 }, userTurn())).content, /最近 1 分钟没有动过的会话/);
+});
+
+test('offer_choices hands 总管 two to five short options and leaves no line on the page', async (t) => {
+  const { tools } = await toolsFor(t);
+  let kept = null;
+  tools.agent.setChoices = (options) => { kept = options; };
+  const out = await tools.run('offer_choices', { options: [' 看看 Claude 在干嘛 ', '跟进宣传视频没结果的'] }, userTurn());
+  assert.deepEqual(kept, ['看看 Claude 在干嘛', '跟进宣传视频没结果的']);
+  assert.equal(out.block, null, 'preparing options is not something the user needs to see');
+  assert.match((await tools.run('offer_choices', { options: ['只有一个'] }, userTurn())).content, /两到五个/);
 });
 
 test('report, remember_instruction and show_card reach the agent, the file and the page', async (t) => {
@@ -707,6 +731,51 @@ test('a tracked session\'s new reply reaches 总管 once things are quiet, where
   await delay(80);
   await settled(zg);
   assert.equal(model.inputs.length, 3, 'dropped: nothing');
+});
+
+test('the common commands and the time of day are in 总管\'s prompt', async (t) => {
+  const { zg, store, model } = await agentFor(t, [reply('在')], { now: () => new Date(2026, 10, 19, 9, 5).getTime() });
+  writeFileSync(store.commandsPath, '- 现在都在干嘛\n\n跟进一下今天没结果的\n');
+  await zg.hear('在吗');
+  await settled(zg);
+  const prompt = model.inputs[0].messages[0].content;
+  assert.match(prompt, /## 常用指令\n- 现在都在干嘛\n- 跟进一下今天没结果的\n/);
+  assert.match(prompt, /## 现在\n2026-11-19 09:05/);
+  assert.match(prompt, /offer_choices/, 'the prompt says to prepare the next options');
+});
+
+test('an empty call brings up the options 总管 prepared as a card, and a pick reaches it as the user\'s words', async (t) => {
+  const { zg, store, state, tools, model } = await agentFor(t, [
+    calling('offer_choices', { options: ['看看 Claude 在干嘛', '跟进宣传视频没结果的'] }), reply('在'), reply('Claude 空闲')]);
+  await zg.hear('在吗');
+  await settled(zg);
+  assert.equal(zg.view().card, null, 'options wait until they are called up');
+  assert.deepEqual(zg.menu(), { st: 'ok', h: '选一个' });
+  const card = zg.view().card;
+  assert.equal(card.kind, 'choices');
+  assert.deepEqual(card.options, ['看看 Claude 在干嘛', '跟进宣传视频没结果的', '不用了']);
+  assert.deepEqual(await zg.choose(card.choiceId, 1), { st: 'sent', h: '总管收到' });
+  await settled(zg);
+  assert.equal(zg.view().card, null, 'a pick closes the card');
+  assert.equal(model.inputs[2].messages.at(-1).content, '看看 Claude 在干嘛');
+  assert.deepEqual(zg.view().blocks.filter((block) => block.kind === 'user').map((block) => block.text), ['在吗', '看看 Claude 在干嘛']);
+  const again = new Zongguan({ state, store, tools, model: scripted([]) });
+  t.after(() => again.close());
+  assert.deepEqual(again.choices, ['看看 Claude 在干嘛', '跟进宣传视频没结果的'], 'kept across restarts');
+});
+
+test('with no options prepared the card lists the first common commands; 不用了 closes it without a turn', async (t) => {
+  const { zg, store, model } = await agentFor(t, []);
+  assert.deepEqual(zg.menu(), { st: 'empty', h: '没听到内容' }, 'nothing to offer: as before');
+  writeFileSync(store.commandsPath, ['a', 'b', 'c', 'd', 'e', 'f'].map((x) => '- 指令' + x).join('\n'));
+  zg.menu();
+  const card = zg.view().card;
+  assert.deepEqual(card.options, ['指令a', '指令b', '指令c', '指令d', '指令e', '不用了']);
+  assert.deepEqual(await zg.choose(card.choiceId, 6), { st: 'ok', h: '好' });
+  assert.equal(zg.view().card, null);
+  assert.deepEqual(await zg.choose(card.choiceId, 1), { st: 'gone', h: '已经处理过了' });
+  await delay(20);
+  assert.equal(model.inputs.length, 0, 'closing the card asks 总管 nothing');
 });
 
 test('prompt tokens at the threshold compact before the next turn and leave a compacted block', async (t) => {
